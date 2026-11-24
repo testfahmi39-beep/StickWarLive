@@ -1,0 +1,67 @@
+name: Build & Deploy Web Game
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.64
+
+      - name: Download raylib & nlohmann/json
+        run: |
+          git clone --depth 1 --branch 5.5 https://github.com/raysan5/raylib.git /tmp/raylib
+          mkdir -p /tmp/include/nlohmann
+          curl -L https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp -o /tmp/include/nlohmann/json.hpp
+
+      - name: Compile raylib for WebAssembly
+        run: |
+          cd /tmp/raylib/src
+          emcc -c rcore.c -Os -Wall -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES2
+          emcc -c rshapes.c -Os -Wall -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES2
+          emcc -c rtextures.c -Os -Wall -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES2
+          emcc -c rtext.c -Os -Wall -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES2
+          emcc -c rmodels.c -Os -Wall -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES2
+          emcc -c utils.c -Os -Wall -DPLATFORM_WEB
+          emcc -c raudio.c -Os -Wall -DPLATFORM_WEB
+          emar rcs /tmp/libraylib.web.a rcore.o rshapes.o rtextures.o rtext.o rmodels.o utils.o raudio.o
+
+      - name: Compile StickWarLive to WebAssembly
+        run: |
+          mkdir -p web
+          emcc main.cpp -o web/index.html \
+            -O2 -Wall -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES2 \
+            -I/tmp/raylib/src -I/tmp/include \
+            /tmp/libraylib.web.a \
+            -sUSE_GLFW=3 \
+            -sALLOW_MEMORY_GROWTH=1 \
+            -sASYNCIFY \
+            --preload-file assets \
+            --preload-file mods
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./web
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
