@@ -1,4 +1,3 @@
-#include "raylib.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <vector>
@@ -178,6 +177,63 @@ EM_JS(void, js_close_keyboard, (), {
     }
 });
 
+EM_JS(void, js_init_pointer_tracking, (), {
+    if (Module["_sw_pointer_bound"]) return;
+    Module["_sw_pointer_bound"] = true;
+    Module["_sw_ptr_x"] = 0.0;
+    Module["_sw_ptr_y"] = 0.0;
+    Module["_sw_ptr_down"] = false;
+    Module["_sw_ptr_pressed"] = false;
+
+    function updatePos(clientX, clientY) {
+        var canvas = document.getElementById("canvas") || document.querySelector("canvas");
+        if (!canvas) return;
+        var rect = canvas.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        var gameW = Module["_sw_gameW"] || 1100;
+        var gameH = Module["_sw_gameH"] || 600;
+        var lx = ((clientX - rect.left) / rect.width) * gameW;
+        var ly = ((clientY - rect.top) / rect.height) * gameH;
+        Module["_sw_ptr_x"] = lx;
+        Module["_sw_ptr_y"] = ly;
+    }
+
+    window.addEventListener("pointermove", function(e) {
+        updatePos(e.clientX, e.clientY);
+    }, { passive: true });
+
+    window.addEventListener("pointerdown", function(e) {
+        updatePos(e.clientX, e.clientY);
+        if (!Module["_sw_ptr_down"]) {
+            Module["_sw_ptr_pressed"] = true;
+        }
+        Module["_sw_ptr_down"] = true;
+    }, { passive: true });
+
+    window.addEventListener("pointerup", function(e) {
+        updatePos(e.clientX, e.clientY);
+        Module["_sw_ptr_down"] = false;
+    }, { passive: true });
+
+    window.addEventListener("pointercancel", function() {
+        Module["_sw_ptr_down"] = false;
+    }, { passive: true });
+});
+
+EM_JS(float, js_get_pointer_x, (), {
+    return Module["_sw_ptr_x"] || 0.0;
+});
+
+EM_JS(float, js_get_pointer_y, (), {
+    return Module["_sw_ptr_y"] || 0.0;
+});
+
+EM_JS(int, js_consume_pointer_pressed, (), {
+    var p = Module["_sw_ptr_pressed"] ? 1 : 0;
+    Module["_sw_ptr_pressed"] = false;
+    return p;
+});
+
 EM_JS(void, js_toggle_fullscreen, (), {
     var canvas = document.getElementById("canvas") || document.querySelector("canvas");
     var target = (canvas && canvas.parentElement) ? canvas.parentElement : canvas;
@@ -204,15 +260,17 @@ EM_JS(void, js_toggle_fullscreen, (), {
 });
 
 EM_JS(void, js_fit_canvas_to_viewport, (int gameW, int gameH), {
+    Module["_sw_gameW"] = gameW;
+    Module["_sw_gameH"] = gameH;
+
     var canvas = document.getElementById("canvas") || document.querySelector("canvas");
     if (!canvas) return;
 
-    var fsEl = document.fullscreenElement || document.webkitFullscreenElement;
-    var vw = fsEl ? window.screen.width : window.innerWidth;
-    var vh = fsEl ? window.screen.height : window.innerHeight;
-    if (window.visualViewport && !fsEl) {
-        vw = window.visualViewport.width;
-        vh = window.visualViewport.height;
+    var vw = window.innerWidth || document.documentElement.clientWidth || 1100;
+    var vh = window.innerHeight || document.documentElement.clientHeight || 600;
+    if (window.visualViewport) {
+        vw = window.visualViewport.width || vw;
+        vh = window.visualViewport.height || vh;
     }
 
     var scale = Math.min(vw / gameW, vh / gameH);
@@ -226,28 +284,15 @@ EM_JS(void, js_fit_canvas_to_viewport, (int gameW, int gameH), {
     canvas.style.top = offY + "px";
     canvas.style.width = dispW + "px";
     canvas.style.height = dispH + "px";
+    canvas.style.maxWidth = "none";
+    canvas.style.maxHeight = "none";
     canvas.style.margin = "0";
     canvas.style.display = "block";
+    canvas.style.touchAction = "none";
     document.documentElement.style.overflow = "hidden";
     document.body.style.overflow = "hidden";
     document.body.style.margin = "0";
     document.body.style.background = "#0d1017";
-
-    Module["_sw_scale"] = scale;
-    Module["_sw_offX"] = offX;
-    Module["_sw_offY"] = offY;
-});
-
-EM_JS(float, js_get_scale, (), {
-    return Module["_sw_scale"] || 1.0;
-});
-
-EM_JS(float, js_get_off_x, (), {
-    return Module["_sw_offX"] || 0.0;
-});
-
-EM_JS(float, js_get_off_y, (), {
-    return Module["_sw_offY"] || 0.0;
 });
 
 extern "C" {
@@ -289,25 +334,19 @@ void ToggleFullscreenMode() {
 }
 
 Vector2 GetLogicalMousePosition() {
-    Vector2 m = GetMousePosition();
 #if defined(PLATFORM_WEB)
-    float s = js_get_scale();
-    float ox = js_get_off_x();
-    float oy = js_get_off_y();
-    if (s > 0.0001f) {
-        float lx = (m.x - ox) / s;
-        float ly = (m.y - oy) / s;
-        if (lx >= 0 && lx <= SCREEN_W && ly >= 0 && ly <= SCREEN_H) {
-            return Vector2{ lx, ly };
-        }
-        float sx = m.x / s;
-        float sy = m.y / s;
-        if (sx >= 0 && sx <= SCREEN_W && sy >= 0 && sy <= SCREEN_H) {
-            return Vector2{ sx, sy };
-        }
-    }
+    return Vector2{ js_get_pointer_x(), js_get_pointer_y() };
+#else
+    return GetMousePosition();
 #endif
-    return m;
+}
+
+bool WasLogicalClickPressed() {
+#if defined(PLATFORM_WEB)
+    return IsMouseButtonPressed(MOUSE_LEFT_BUTTON) || (js_consume_pointer_pressed() != 0);
+#else
+    return IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
+#endif
 }
 
 void SaveConfig() {
@@ -566,7 +605,7 @@ void PollLiveEvents() {
 void DrawFullscreenButton() {
     Rectangle fsBtn = { SCREEN_W - 72.0f, SCREEN_H - 42.0f, 56.0f, 30.0f };
     Vector2 mouse = GetLogicalMousePosition();
-    bool clicked = IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
+    bool clicked = WasLogicalClickPressed();
 
     DrawRectangleRec(fsBtn, Fade(BLACK, 0.75f));
     DrawRectangleLinesEx(fsBtn, 2, GOLD);
@@ -579,7 +618,7 @@ void DrawFullscreenButton() {
 
 void UpdateDrawMenu() {
     Vector2 mouse = GetLogicalMousePosition();
-    bool clicked = IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
+    bool clicked = WasLogicalClickPressed();
 
     float centerX = SCREEN_W * 0.5f;
     Rectangle inputBox = { centerX - 210.0f, 215.0f, 355.0f, 44.0f };
@@ -878,7 +917,7 @@ void UpdateDrawGame() {
              165, 19, 18, SKYBLUE);
 
     Vector2 mouse = GetLogicalMousePosition();
-    bool clicked = IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
+    bool clicked = WasLogicalClickPressed();
 
     for (int i = 0; i < (int)unitCatalog.size(); i++) {
         Rectangle btn = { 20.0f + i * 165.0f, 52.0f, 155.0f, 42.0f };
@@ -1003,6 +1042,7 @@ void UpdateDrawGame() {
 
 void UpdateDrawFrame() {
 #if defined(PLATFORM_WEB)
+    js_init_pointer_tracking();
     js_fit_canvas_to_viewport(SCREEN_W, SCREEN_H);
 #endif
     PollLiveEvents();
@@ -1021,6 +1061,7 @@ int main() {
     InitLiveSocket(9090);
 
 #if defined(PLATFORM_WEB)
+    js_init_pointer_tracking();
     js_fit_canvas_to_viewport(SCREEN_W, SCREEN_H);
     emscripten_set_main_loop(UpdateDrawFrame, 60, 1);
 #else
