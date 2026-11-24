@@ -1,0 +1,52 @@
+{
+  "units": [
+    {
+      "id": "swordwrath",
+      "name": "Swordwrath",
+      "cost": 125,
+      "hp": 120,
+      "damage": 18,
+      "speed": 95.0,
+      "range": 38.0,
+      "attackCooldown": 0.75,
+      "scale": 1.0,
+      "spriteRow": 0,
+      "tint": [70, 160, 255, 255],
+      "enemyTint": [255, 85, 85, 255],
+      "allyTrigger": "Rose",
+      "enemyTrigger": "GG"
+    },
+    {
+      "id": "archidon",
+      "name": "Archidon",
+      "cost": 200,
+      "hp": 85,
+      "damage": 15,
+      "speed": 80.0,
+      "range": 240.0,
+      "attackCooldown": 1.15,
+      "scale": 1.0,
+      "spriteRow": 1,
+      "tint": [80, 220, 140, 255],
+      "enemyTint": [255, 140, 60, 255],
+      "allyTrigger": "Finger Heart",
+      "enemyTrigger": "Ice Cream"
+    },
+    {
+      "id": "giant",
+      "name": "Giant",
+      "cost": 550,
+      "hp": 520,
+      "damage": 55,
+      "speed": 42.0,
+      "range": 55.0,
+      "attackCooldown": 1.6,
+      "scale": 1.55,
+      "spriteRow": 2,
+      "tint": [180, 130, 255, 255],
+      "enemyTint": [220, 50, 150, 255],
+      "allyTrigger": "Galaxy",
+      "enemyTrigger": "Lion"
+    }
+  ]
+}
