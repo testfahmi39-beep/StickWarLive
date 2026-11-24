@@ -1,5 +1,3 @@
-#include "raylib.h"
-#include "raylib.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <vector>
@@ -79,6 +77,11 @@ struct FloatingAlert {
     float timer;
 };
 
+struct LogEntry {
+    std::string text;
+    Color color;
+};
+
 const int SCREEN_W = 1100;
 const int SCREEN_H = 600;
 const float GROUND_Y = 470.0f;
@@ -90,6 +93,7 @@ MatchResult matchResult = MATCH_ACTIVE;
 std::vector<UnitTemplate> unitCatalog;
 std::vector<Unit> units;
 std::vector<FloatingAlert> alerts;
+std::vector<LogEntry> errorLogs;
 
 // Textures
 Texture2D unitSheet;
@@ -122,10 +126,58 @@ bool inputBoxActive = false;
 bool streamConnected = false;
 std::string connectedUser = "";
 std::string menuStatusMsg = "Enter streamer @username and press CONNECT";
+std::string bridgeUrl = "ws://127.0.0.1:8765";
 
 bool liveMenuOpen = true;
 int udpSock = -1;
 int liveEventsReceived = 0;
+
+void PushLog(const std::string& msg, Color col = LIGHTGRAY) {
+    errorLogs.push_back({msg, col});
+    if (errorLogs.size() > 6) {
+        errorLogs.erase(errorLogs.begin());
+    }
+    std::cout << "[LOG] " << msg << std::endl;
+}
+
+void HandleIncomingLiveJson(const std::string& rawJson) {
+    try {
+        json msg = json::parse(rawJson);
+        std::string type = msg.value("type", "spawn");
+        if (type == "error") {
+            std::string errText = msg.value("message", "Unknown bridge error");
+            streamConnected = false;
+            menuStatusMsg = "Error: " + errText;
+            PushLog("ERR: " + errText, RED);
+            return;
+        }
+        if (type == "status") {
+            bool prevConn = streamConnected;
+            streamConnected = msg.value("connected", false);
+            std::string statusText = msg.value("message", "Bridge updated");
+            menuStatusMsg = statusText;
+            if (streamConnected && !prevConn) {
+                PushLog("OK: " + statusText, GREEN);
+            } else if (!streamConnected) {
+                PushLog("WARN: " + statusText, ORANGE);
+            } else {
+                PushLog("INFO: " + statusText, SKYBLUE);
+            }
+            return;
+        }
+        if (currentScreen == SCREEN_PLAYING && matchResult == MATCH_ACTIVE) {
+            std::string team = msg.value("team", "enemy");
+            std::string unitId = msg.value("unit", "swordwrath");
+            std::string user = msg.value("user", "Viewer");
+            bool isPlayer = (team == "ally" || team == "player");
+            // Forward declaration handled below via SpawnUnit
+        }
+    } catch (const std::exception& e) {
+        PushLog(std::string("JSON ERR: ") + e.what(), RED);
+    } catch (...) {
+        PushLog("JSON ERR: Invalid payload from bridge", RED);
+    }
+}
 
 #if defined(PLATFORM_WEB)
 EM_JS(void, js_open_keyboard, (const char* initialVal), {
@@ -186,6 +238,7 @@ EM_JS(void, js_init_pointer_tracking, (), {
     Module["_sw_ptr_y"] = 0.0;
     Module["_sw_ptr_down"] = false;
     Module["_sw_ptr_pressed"] = false;
+    Module["_sw_last_press_ms"] = 0.0;
 
     function updatePos(clientX, clientY) {
         var canvas = document.getElementById("canvas") || document.querySelector("canvas");
@@ -206,8 +259,10 @@ EM_JS(void, js_init_pointer_tracking, (), {
 
     window.addEventListener("pointerdown", function(e) {
         updatePos(e.clientX, e.clientY);
-        if (!Module["_sw_ptr_down"]) {
+        var now = performance.now();
+        if (!Module["_sw_ptr_down"] && (now - (Module["_sw_last_press_ms"] || 0) > 80)) {
             Module["_sw_ptr_pressed"] = true;
+            Module["_sw_last_press_ms"] = now;
         }
         Module["_sw_ptr_down"] = true;
     }, { passive: true });
@@ -297,6 +352,122 @@ EM_JS(void, js_fit_canvas_to_viewport, (int gameW, int gameH), {
     document.body.style.background = "#0d1017";
 });
 
+EM_JS(void, js_ws_connect, (const char* urlPtr, const char* userPtr), {
+    var url = UTF8ToString(urlPtr || "");
+    var user = UTF8ToString(userPtr || "");
+    Module["_sw_ws_queue"] = Module["_sw_ws_queue"] || [];
+
+    if (!url) {
+        Module["_sw_ws_queue"].push(JSON.stringify({
+            type: "error",
+            message: "WebSocket bridge URL is empty"
+        }));
+        return;
+    }
+
+    if (window.location && window.location.protocol === "https:" && url.indexOf("ws://") === 0 && url.indexOf("127.0.0.1") === -1 && url.indexOf("localhost") === -1) {
+        Module["_sw_ws_queue"].push(JSON.stringify({
+            type: "error",
+            message: "HTTPS page blocked plain ws:// (use wss:// or local bridge)"
+        }));
+        return;
+    }
+
+    try {
+        if (Module["_sw_ws"]) {
+            try { Module["_sw_ws"].onclose = null; Module["_sw_ws"].close(); } catch (e) {}
+        }
+        Module["_sw_ws_queue"].push(JSON.stringify({
+            type: "status",
+            connected: false,
+            message: "Dialing bridge " + url + " for @" + user + "..."
+        }));
+
+        var ws = new WebSocket(url);
+        Module["_sw_ws"] = ws;
+
+        ws.onopen = function() {
+            Module["_sw_ws_queue"].push(JSON.stringify({
+                type: "status",
+                connected: true,
+                message: "Bridge WS open for @" + user
+            }));
+            ws.send(JSON.stringify({ action: "connect", username: user }));
+        };
+
+        ws.onmessage = function(ev) {
+            if (typeof ev.data === "string") {
+                Module["_sw_ws_queue"].push(ev.data);
+            }
+        };
+
+        ws.onerror = function() {
+            Module["_sw_ws_queue"].push(JSON.stringify({
+                type: "error",
+                message: "WebSocket error reaching " + url + " (is bridge running?)"
+            }));
+        };
+
+        ws.onclose = function(ev) {
+            Module["_sw_ws_queue"].push(JSON.stringify({
+                type: "status",
+                connected: false,
+                message: "Bridge closed (code " + ev.code + ")"
+            }));
+        };
+    } catch (err) {
+        Module["_sw_ws_queue"].push(JSON.stringify({
+            type: "error",
+            message: "WS init failed: " + (err && err.message ? err.message : String(err))
+        }));
+    }
+});
+
+EM_JS(void, js_ws_send, (const char* payloadPtr), {
+    var ws = Module["_sw_ws"];
+    var payload = UTF8ToString(payloadPtr || "");
+    Module["_sw_ws_queue"] = Module["_sw_ws_queue"] || [];
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(payload);
+    } else {
+        Module["_sw_ws_queue"].push(JSON.stringify({
+            type: "status",
+            connected: false,
+            message: "Bridge not open; skipped sending command"
+        }));
+    }
+});
+
+EM_JS(void, js_ws_disconnect, (const char* userPtr), {
+    var user = UTF8ToString(userPtr || "");
+    var ws = Module["_sw_ws"];
+    if (ws) {
+        try {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ action: "disconnect", username: user }));
+            }
+            ws.onclose = null;
+            ws.close();
+        } catch (e) {}
+        Module["_sw_ws"] = null;
+    }
+});
+
+EM_JS(int, js_ws_has_msg, (), {
+    var q = Module["_sw_ws_queue"];
+    return (q && q.length > 0) ? 1 : 0;
+});
+
+EM_JS(void, js_ws_pop_msg, (char* dst, int maxLen), {
+    var q = Module["_sw_ws_queue"];
+    if (!q || q.length === 0) {
+        stringToUTF8("", dst, maxLen);
+        return;
+    }
+    var item = q.shift();
+    stringToUTF8(item, dst, maxLen);
+});
+
 extern "C" {
 EMSCRIPTEN_KEEPALIVE
 void web_set_username(const char* str) {
@@ -345,9 +516,7 @@ Vector2 GetLogicalMousePosition() {
 
 bool WasLogicalClickPressed() {
 #if defined(PLATFORM_WEB)
-    bool jsPressed = (js_consume_pointer_pressed() != 0);
-    bool rlPressed = IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
-    return jsPressed || rlPressed;
+    return (js_consume_pointer_pressed() != 0);
 #else
     return IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
 #endif
@@ -360,6 +529,7 @@ void SaveConfig() {
     cfg["totalWins"] = totalWins;
     cfg["totalMatches"] = totalMatches;
     cfg["lastUsername"] = std::string(usernameInput);
+    cfg["bridgeUrl"] = bridgeUrl;
 
     std::ofstream out(CONFIG_PATH);
     if (out.is_open()) {
@@ -379,6 +549,7 @@ void LoadConfig() {
         matchPool = std::max(targetWins, cfg.value("matchPool", 10));
         totalWins = std::max(0, cfg.value("totalWins", 0));
         totalMatches = std::max(0, cfg.value("totalMatches", 0));
+        bridgeUrl = cfg.value("bridgeUrl", std::string("ws://127.0.0.1:8765"));
 
         std::string savedUser = cfg.value("lastUsername", "");
         if (!savedUser.empty()) {
@@ -387,7 +558,9 @@ void LoadConfig() {
             usernameInput[len] = '\0';
             usernameLen = (int)len;
         }
-    } catch (...) {}
+    } catch (...) {
+        PushLog("WARN: Failed parsing mods/config.json, using defaults", ORANGE);
+    }
 }
 
 Color ParseColor(const json& arr, Color fallback) {
@@ -404,26 +577,33 @@ Color ParseColor(const json& arr, Color fallback) {
 
 void LoadUnitCatalog(const std::string& path) {
     std::ifstream f(path);
-    if (!f.is_open()) return;
-    json data = json::parse(f);
-    unitCatalog.clear();
-    for (const auto& u : data["units"]) {
-        UnitTemplate t;
-        t.id = u.value("id", "unit");
-        t.name = u.value("name", "Unit");
-        t.cost = u.value("cost", 100);
-        t.hp = u.value("hp", 100.0f);
-        t.damage = u.value("damage", 15.0f);
-        t.speed = u.value("speed", 80.0f);
-        t.range = u.value("range", 40.0f);
-        t.attackCooldown = u.value("attackCooldown", 1.0f);
-        t.scale = u.value("scale", 1.0f);
-        t.spriteRow = u.value("spriteRow", 0);
-        t.tint = ParseColor(u["tint"], BLUE);
-        t.enemyTint = ParseColor(u["enemyTint"], RED);
-        t.allyTrigger = u.value("allyTrigger", "Rose");
-        t.enemyTrigger = u.value("enemyTrigger", "GG");
-        unitCatalog.push_back(t);
+    if (!f.is_open()) {
+        PushLog("WARN: Could not open " + path, ORANGE);
+        return;
+    }
+    try {
+        json data = json::parse(f);
+        unitCatalog.clear();
+        for (const auto& u : data["units"]) {
+            UnitTemplate t;
+            t.id = u.value("id", "unit");
+            t.name = u.value("name", "Unit");
+            t.cost = u.value("cost", 100);
+            t.hp = u.value("hp", 100.0f);
+            t.damage = u.value("damage", 15.0f);
+            t.speed = u.value("speed", 80.0f);
+            t.range = u.value("range", 40.0f);
+            t.attackCooldown = u.value("attackCooldown", 1.0f);
+            t.scale = u.value("scale", 1.0f);
+            t.spriteRow = u.value("spriteRow", 0);
+            t.tint = ParseColor(u["tint"], BLUE);
+            t.enemyTint = ParseColor(u["enemyTint"], RED);
+            t.allyTrigger = u.value("allyTrigger", "Rose");
+            t.enemyTrigger = u.value("enemyTrigger", "GG");
+            unitCatalog.push_back(t);
+        }
+    } catch (...) {
+        PushLog("ERR: Invalid JSON in " + path, RED);
     }
 }
 
@@ -457,8 +637,8 @@ void EnsureStarterAssets() {
         UnloadImage(img);
     }
     unitSheet = LoadTexture("assets/units.png");
-    FRAME_W = unitSheet.width / SHEET_COLS;
-    FRAME_H = unitSheet.height / SHEET_ROWS;
+    FRAME_W = std::max(1, unitSheet.width / SHEET_COLS);
+    FRAME_H = std::max(1, unitSheet.height / SHEET_ROWS);
 
     if (!FileExists("assets/statue.png")) {
         Image sImg = GenImageColor(64, 140, BLANK);
@@ -532,6 +712,7 @@ void SpawnUnit(const std::string& id, bool isPlayer, const std::string& ownerNam
             return;
         }
     }
+    PushLog("WARN: Unknown unit id '" + id + "'", ORANGE);
 }
 
 void InitLiveSocket(int port) {
@@ -547,15 +728,64 @@ void InitLiveSocket(int port) {
         if (bind(udpSock, (sockaddr*)&addr, sizeof(addr)) < 0) {
             close(udpSock);
             udpSock = -1;
+            PushLog("ERR: Failed binding UDP port " + std::to_string(port), RED);
+        } else {
+            PushLog("OK: Listening on UDP 127.0.0.1:" + std::to_string(port), GREEN);
         }
+    } else {
+        PushLog("ERR: Could not create UDP socket", RED);
     }
 #else
     (void)port;
+    PushLog("INFO: Web build uses WS bridge (" + bridgeUrl + ")", SKYBLUE);
+#endif
+}
+
+void ConnectLiveStream(const std::string& username) {
+#if defined(PLATFORM_WEB)
+    js_ws_connect(bridgeUrl.c_str(), username.c_str());
+#else
+    int txSock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (txSock < 0) {
+        PushLog("ERR: Failed creating UDP command socket", RED);
+        return;
+    }
+
+    sockaddr_in bridgeAddr{};
+    bridgeAddr.sin_family = AF_INET;
+    bridgeAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    bridgeAddr.sin_port = htons(9091);
+
+    json cmd = {
+        {"action", "connect"},
+        {"username", username}
+    };
+    std::string payload = cmd.dump();
+    ssize_t sent = sendto(txSock, payload.c_str(), payload.size(), 0, (sockaddr*)&bridgeAddr, sizeof(bridgeAddr));
+    close(txSock);
+
+    if (sent < 0) {
+        PushLog("ERR: Failed sending connect to UDP :9091", RED);
+    } else {
+        PushLog("SENT: connect @" + username + " -> :9091", SKYBLUE);
+    }
 #endif
 }
 
 void SendBridgeCommand(const std::string& action, const std::string& username) {
-#if !defined(PLATFORM_WEB)
+#if defined(PLATFORM_WEB)
+    json cmd = {
+        {"action", action},
+        {"username", username}
+    };
+    if (action == "disconnect") {
+        js_ws_disconnect(username.c_str());
+        streamConnected = false;
+        PushLog("INFO: Disconnected @" + username, LIGHTGRAY);
+    } else {
+        js_ws_send(cmd.dump().c_str());
+    }
+#else
     int txSock = socket(AF_INET, SOCK_DGRAM, 0);
     if (txSock < 0) return;
 
@@ -571,39 +801,78 @@ void SendBridgeCommand(const std::string& action, const std::string& username) {
     std::string payload = cmd.dump();
     sendto(txSock, payload.c_str(), payload.size(), 0, (sockaddr*)&bridgeAddr, sizeof(bridgeAddr));
     close(txSock);
-#else
-    (void)action;
-    (void)username;
 #endif
 }
 
+void ProcessLiveMessage(const std::string& raw) {
+    try {
+        json msg = json::parse(raw);
+        std::string type = msg.value("type", "spawn");
+        if (type == "error") {
+            std::string errText = msg.value("message", "Unknown bridge error");
+            streamConnected = false;
+            menuStatusMsg = "Error: " + errText;
+            PushLog("ERR: " + errText, RED);
+            return;
+        }
+        if (type == "status") {
+            bool prevConn = streamConnected;
+            streamConnected = msg.value("connected", false);
+            std::string statusText = msg.value("message", "Bridge updated");
+            menuStatusMsg = statusText;
+            if (streamConnected && !prevConn) {
+                PushLog("OK: " + statusText, GREEN);
+            } else if (!streamConnected) {
+                PushLog("WARN: " + statusText, ORANGE);
+            } else {
+                PushLog("INFO: " + statusText, SKYBLUE);
+            }
+            return;
+        }
+        if (currentScreen == SCREEN_PLAYING && matchResult == MATCH_ACTIVE) {
+            std::string team = msg.value("team", "enemy");
+            std::string unitId = msg.value("unit", "swordwrath");
+            std::string user = msg.value("user", "Viewer");
+            bool isPlayer = (team == "ally" || team == "player");
+            SpawnUnit(unitId, isPlayer, user);
+            liveEventsReceived++;
+        }
+    } catch (const std::exception& e) {
+        PushLog(std::string("ERR: ") + e.what(), RED);
+    } catch (...) {
+        PushLog("ERR: Malformed live event JSON", RED);
+    }
+}
+
 void PollLiveEvents() {
-#if !defined(PLATFORM_WEB)
+#if defined(PLATFORM_WEB)
+    char msgBuf[1024];
+    while (js_ws_has_msg() != 0) {
+        js_ws_pop_msg(msgBuf, (int)sizeof(msgBuf));
+        if (msgBuf[0] != '\0') {
+            ProcessLiveMessage(std::string(msgBuf));
+        }
+    }
+#else
     if (udpSock < 0) return;
     char buf[1024];
     while (true) {
         ssize_t n = recvfrom(udpSock, buf, sizeof(buf) - 1, 0, nullptr, nullptr);
         if (n <= 0) break;
         buf[n] = '\0';
-        try {
-            json msg = json::parse(buf);
-            std::string type = msg.value("type", "spawn");
-            if (type == "status") {
-                streamConnected = msg.value("connected", false);
-                menuStatusMsg = msg.value("message", "Bridge updated");
-                continue;
-            }
-            if (currentScreen == SCREEN_PLAYING && matchResult == MATCH_ACTIVE) {
-                std::string team = msg.value("team", "enemy");
-                std::string unitId = msg.value("unit", "swordwrath");
-                std::string user = msg.value("user", "Viewer");
-                bool isPlayer = (team == "ally" || team == "player");
-                SpawnUnit(unitId, isPlayer, user);
-                liveEventsReceived++;
-            }
-        } catch (...) {}
+        ProcessLiveMessage(std::string(buf));
     }
 #endif
+}
+
+void DrawErrorLogBox(float x, float y, float w, float h) {
+    DrawRectangleRec({x, y, w, h}, Fade(BLACK, 0.82f));
+    DrawRectangleLinesEx({x, y, w, h}, 1.5f, GRAY);
+    DrawText("LIVE / BRIDGE LOG:", (int)x + 8, (int)y + 5, 12, GOLD);
+
+    for (size_t i = 0; i < errorLogs.size(); i++) {
+        DrawText(errorLogs[i].text.c_str(), (int)x + 8, (int)(y + 20 + i * 14), 12, errorLogs[i].color);
+    }
 }
 
 void DrawFullscreenButton() {
@@ -625,17 +894,17 @@ void UpdateDrawMenu() {
     bool clicked = WasLogicalClickPressed();
 
     float centerX = SCREEN_W * 0.5f;
-    Rectangle inputBox = { centerX - 210.0f, 215.0f, 355.0f, 44.0f };
-    Rectangle delBtn   = { centerX + 153.0f, 215.0f, 57.0f,  44.0f };
+    Rectangle inputBox = { centerX - 210.0f, 200.0f, 355.0f, 42.0f };
+    Rectangle delBtn   = { centerX + 153.0f, 200.0f, 57.0f,  42.0f };
 
-    Rectangle winMinusBtn  = { centerX - 195.0f, 282.0f, 36.0f, 36.0f };
-    Rectangle winPlusBtn   = { centerX - 95.0f,  282.0f, 36.0f, 36.0f };
-    Rectangle poolMinusBtn = { centerX + 45.0f,  282.0f, 36.0f, 36.0f };
-    Rectangle poolPlusBtn  = { centerX + 145.0f, 282.0f, 36.0f, 36.0f };
-    Rectangle resetRecBtn  = { centerX + 115.0f, 326.0f, 95.0f, 26.0f };
+    Rectangle winMinusBtn  = { centerX - 195.0f, 266.0f, 36.0f, 34.0f };
+    Rectangle winPlusBtn   = { centerX - 95.0f,  266.0f, 36.0f, 34.0f };
+    Rectangle poolMinusBtn = { centerX + 45.0f,  266.0f, 36.0f, 34.0f };
+    Rectangle poolPlusBtn  = { centerX + 145.0f, 266.0f, 36.0f, 34.0f };
+    Rectangle resetRecBtn  = { centerX + 115.0f, 308.0f, 95.0f, 24.0f };
 
-    Rectangle connectPlayBtn = { centerX - 210.0f, 362.0f, 200.0f, 48.0f };
-    Rectangle quickPlayBtn   = { centerX + 10.0f,  362.0f, 200.0f, 48.0f };
+    Rectangle connectPlayBtn = { centerX - 210.0f, 342.0f, 200.0f, 44.0f };
+    Rectangle quickPlayBtn   = { centerX + 10.0f,  342.0f, 200.0f, 44.0f };
 
     if (clicked) {
         if (CheckCollisionPointRec(mouse, delBtn)) {
@@ -705,11 +974,12 @@ void UpdateDrawMenu() {
         SaveConfig();
         if (cleanUser.empty()) {
             menuStatusMsg = "Please type a streamer username first!";
+            PushLog("WARN: Empty username on CONNECT", ORANGE);
         } else {
             connectedUser = cleanUser;
-            streamConnected = true;
-            menuStatusMsg = "Connecting @" + connectedUser + " via bridge...";
-            SendBridgeCommand("connect", connectedUser);
+            streamConnected = false;
+            menuStatusMsg = "Connecting @" + connectedUser + "...";
+            ConnectLiveStream(connectedUser);
             ResetMatch();
             currentScreen = SCREEN_PLAYING;
         }
@@ -720,6 +990,8 @@ void UpdateDrawMenu() {
         SaveConfig();
         connectedUser = "Offline / Sim";
         streamConnected = false;
+        menuStatusMsg = "Running in Offline / Sim mode";
+        PushLog("INFO: Entered Offline / Sim mode", SKYBLUE);
         ResetMatch();
         currentScreen = SCREEN_PLAYING;
     }
@@ -730,66 +1002,65 @@ void UpdateDrawMenu() {
     DrawRectangle(0, 0, SCREEN_W, SCREEN_H, Fade(BLACK, 0.45f));
 
     const char* title = "STICK WAR: LIVE INTERACTIVE";
-    int titleW = MeasureText(title, 42);
-    DrawText(title, (SCREEN_W - titleW) / 2, 70, 42, GOLD);
+    int titleW = MeasureText(title, 40);
+    DrawText(title, (SCREEN_W - titleW) / 2, 54, 40, GOLD);
 
     const char* subtitle = "Viewers control the battlefield via Live Chat & Gifts";
-    int subW = MeasureText(subtitle, 19);
-    DrawText(subtitle, (SCREEN_W - subW) / 2, 120, 19, LIGHTGRAY);
+    int subW = MeasureText(subtitle, 18);
+    DrawText(subtitle, (SCREEN_W - subW) / 2, 100, 18, LIGHTGRAY);
 
-    DrawRectangleRounded({ centerX - 245.0f, 155.0f, 490.0f, 290.0f }, 0.08f, 8, Fade(BLACK, 0.82f));
-    DrawRectangleRoundedLinesEx({ centerX - 245.0f, 155.0f, 490.0f, 290.0f }, 0.08f, 8, 2, PURPLE);
+    DrawRectangleRounded({ centerX - 245.0f, 134.0f, 490.0f, 294.0f }, 0.08f, 8, Fade(BLACK, 0.82f));
+    DrawRectangleRoundedLinesEx({ centerX - 245.0f, 134.0f, 490.0f, 294.0f }, 0.08f, 8, 2, PURPLE);
 
-    DrawText("STREAMER USERNAME (@handle):", (int)(centerX - 210), 185, 17, SKYBLUE);
+    DrawText("STREAMER USERNAME (@handle):", (int)(centerX - 210), 174, 16, SKYBLUE);
 
     DrawRectangleRec(inputBox, Color{30, 35, 48, 255});
     DrawRectangleLinesEx(inputBox, 2, inputBoxActive ? GOLD : GRAY);
     if (usernameLen == 0) {
-        DrawText("e.g. aiman_live", (int)inputBox.x + 14, (int)inputBox.y + 11, 20, DARKGRAY);
+        DrawText("e.g. aiman_live", (int)inputBox.x + 14, (int)inputBox.y + 10, 20, DARKGRAY);
     } else {
-        DrawText(usernameInput, (int)inputBox.x + 14, (int)inputBox.y + 11, 20, WHITE);
+        DrawText(usernameInput, (int)inputBox.x + 14, (int)inputBox.y + 10, 20, WHITE);
     }
     DrawRectangleRec(delBtn, MAROON);
     DrawRectangleLinesEx(delBtn, 2, LIGHTGRAY);
-    DrawText("DEL", (int)delBtn.x + 12, (int)delBtn.y + 13, 16, WHITE);
+    DrawText("DEL", (int)delBtn.x + 12, (int)delBtn.y + 12, 16, WHITE);
     if (inputBoxActive && ((int)(GetTime() * 2) % 2 == 0)) {
         int textW = MeasureText(usernameInput, 20);
-        DrawRectangle((int)inputBox.x + 16 + textW, (int)inputBox.y + 10, 2, 24, GOLD);
+        DrawRectangle((int)inputBox.x + 16 + textW, (int)inputBox.y + 9, 2, 24, GOLD);
     }
 
     DrawText(TextFormat("CUSTOM WIN RATIO: Win %d/%d", targetWins, matchPool),
-             (int)(centerX - 210), 263, 16, GOLD);
+             (int)(centerX - 210), 248, 15, GOLD);
 
     DrawRectangleRec(winMinusBtn, DARKGRAY);
-    DrawText("-", (int)winMinusBtn.x + 13, (int)winMinusBtn.y + 8, 20, WHITE);
-    DrawText(TextFormat("W:%d", targetWins), (int)(centerX - 150), 290, 18, SKYBLUE);
+    DrawText("-", (int)winMinusBtn.x + 13, (int)winMinusBtn.y + 7, 20, WHITE);
+    DrawText(TextFormat("W:%d", targetWins), (int)(centerX - 150), 274, 18, SKYBLUE);
     DrawRectangleRec(winPlusBtn, DARKGRAY);
-    DrawText("+", (int)winPlusBtn.x + 12, (int)winPlusBtn.y + 8, 20, WHITE);
+    DrawText("+", (int)winPlusBtn.x + 12, (int)winPlusBtn.y + 7, 20, WHITE);
 
     DrawRectangleRec(poolMinusBtn, DARKGRAY);
-    DrawText("-", (int)poolMinusBtn.x + 13, (int)poolMinusBtn.y + 8, 20, WHITE);
-    DrawText(TextFormat("M:%d", matchPool), (int)(centerX + 90), 290, 18, ORANGE);
+    DrawText("-", (int)poolMinusBtn.x + 13, (int)poolMinusBtn.y + 7, 20, WHITE);
+    DrawText(TextFormat("M:%d", matchPool), (int)(centerX + 90), 274, 18, ORANGE);
     DrawRectangleRec(poolPlusBtn, DARKGRAY);
-    DrawText("+", (int)poolPlusBtn.x + 12, (int)poolPlusBtn.y + 8, 20, WHITE);
+    DrawText("+", (int)poolPlusBtn.x + 12, (int)poolPlusBtn.y + 7, 20, WHITE);
 
     DrawText(TextFormat("Record: %d Wins / %d Matches", totalWins, totalMatches),
-             (int)(centerX - 210), 331, 15, LIGHTGRAY);
+             (int)(centerX - 210), 312, 15, LIGHTGRAY);
     DrawRectangleRec(resetRecBtn, MAROON);
-    DrawText("Reset", (int)resetRecBtn.x + 24, (int)resetRecBtn.y + 6, 14, WHITE);
+    DrawText("Reset", (int)resetRecBtn.x + 24, (int)resetRecBtn.y + 5, 14, WHITE);
 
     DrawRectangleRec(connectPlayBtn, Color{110, 40, 175, 255});
     DrawRectangleLinesEx(connectPlayBtn, 2, WHITE);
-    DrawText("CONNECT & PLAY", (int)connectPlayBtn.x + 18, (int)connectPlayBtn.y + 15, 18, WHITE);
+    DrawText("CONNECT & PLAY", (int)connectPlayBtn.x + 18, (int)connectPlayBtn.y + 13, 18, WHITE);
 
     DrawRectangleRec(quickPlayBtn, Color{40, 95, 140, 255});
     DrawRectangleLinesEx(quickPlayBtn, 2, SKYBLUE);
-    DrawText("PLAY / SIM MODE", (int)quickPlayBtn.x + 22, (int)quickPlayBtn.y + 15, 18, WHITE);
+    DrawText("PLAY / SIM MODE", (int)quickPlayBtn.x + 22, (int)quickPlayBtn.y + 13, 18, WHITE);
 
     int statusW = MeasureText(menuStatusMsg.c_str(), 15);
-    DrawText(menuStatusMsg.c_str(), (SCREEN_W - statusW) / 2, 420, 15, GOLD);
+    DrawText(menuStatusMsg.c_str(), (SCREEN_W - statusW) / 2, 398, 15, GOLD);
 
-    DrawText("Custom Art: Edit assets/units.png, assets/statue.png & assets/bg.png | Config: mods/config.json",
-             20, SCREEN_H - 28, 14, LIGHTGRAY);
+    DrawErrorLogBox(20.0f, 452.0f, 540.0f, 114.0f);
 
     DrawFullscreenButton();
     EndDrawing();
@@ -919,6 +1190,8 @@ void UpdateDrawGame() {
     DrawText(TextFormat("GOLD: %d", (int)playerGold), 20, 16, 22, GOLD);
     DrawText(TextFormat("WIN RATIO: %d/%d (Rec: %d/%d)", totalWins, matchPool, totalWins, totalMatches),
              165, 19, 18, SKYBLUE);
+    DrawText(streamConnected ? "LIVE: CONNECTED" : "LIVE: OFFLINE/WAITING",
+             465, 19, 16, streamConnected ? GREEN : ORANGE);
 
     Vector2 mouse = GetLogicalMousePosition();
     bool clicked = WasLogicalClickPressed();
@@ -1000,6 +1273,8 @@ void UpdateDrawGame() {
             }
         }
     }
+
+    DrawErrorLogBox(20.0f, 452.0f, 540.0f, 114.0f);
 
     if (matchResult != MATCH_ACTIVE) {
         DrawRectangle(0, 0, SCREEN_W, SCREEN_H, Fade(BLACK, 0.65f));
