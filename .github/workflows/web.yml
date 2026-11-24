@@ -42,11 +42,11 @@ jobs:
           emcc -c rmodels.c -Os -Wall -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES2
           emcc -c utils.c -Os -Wall -DPLATFORM_WEB
           emcc -c raudio.c -Os -Wall -DPLATFORM_WEB
-          emar rcs /tmp/libraylib.web.a rcore.o rshapes.c rtextures.o rtext.o rmodels.o utils.o raudio.o
+          emar rcs /tmp/libraylib.web.a rcore.o rshapes.o rtextures.o rtext.o rmodels.o utils.o raudio.o
 
       - name: Compile StickWarLive to WebAssembly
         run: |
-          mkdir -p web assets mods
+          mkdir -p web && mkdir -p assets && mkdir -p mods
           emcc main.cpp -o web/index.html \
             -O2 -Wall -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES2 \
             -I/tmp/raylib/src -I/tmp/include \
