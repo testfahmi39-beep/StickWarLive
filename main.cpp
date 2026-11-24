@@ -1,4 +1,3 @@
-#include "raylib.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <vector>
@@ -7,16 +6,19 @@
 #include <algorithm>
 #include <iostream>
 
-// POSIX non-blocking UDP sockets
+// POSIX non-blocking UDP sockets (native builds)
+#if !defined(PLATFORM_WEB)
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 #include <cstring>
 
 #if defined(PLATFORM_WEB)
-    #include <emscripten/emscripten.h>
+#include <emscripten/emscripten.h>
+#include <emscripten/html5.h>
 #endif
 
 using json = nlohmann::json;
@@ -115,7 +117,7 @@ int totalMatches = 0;   // Actual matches played
 // Main Menu & Live Stream Connector State
 char usernameInput[64] = "";
 int usernameLen = 0;
-bool inputBoxActive = true;
+bool inputBoxActive = false;
 bool streamConnected = false;
 std::string connectedUser = "";
 std::string menuStatusMsg = "Enter streamer @username and press CONNECT";
@@ -123,6 +125,196 @@ std::string menuStatusMsg = "Enter streamer @username and press CONNECT";
 bool liveMenuOpen = true;
 int udpSock = -1;
 int liveEventsReceived = 0;
+
+// Web viewport transform for accurate touch/click & aspect-fit fullscreen
+float viewScale = 1.0f;
+float viewOffsetX = 0.0f;
+float viewOffsetY = 0.0f;
+
+#if defined(PLATFORM_WEB)
+EM_JS(void, js_open_keyboard, (const char* initialVal), {
+    var inp = document.getElementById('mobile_username_input');
+    if (!inp) {
+        inp = document.createElement('input');
+        inp.id = 'mobile_username_input';
+        inp.type = 'text';
+        inp.autocapitalize = 'off';
+        inp.autocomplete = 'off';
+        inp.autocorrect = 'off';
+        inp.spellcheck = false;
+        inp.style.position = 'fixed';
+        inp.style.left = '50%';
+        inp.style.top = '10px';
+        inp.style.transform = 'translateX(-50%)';
+        inp.style.width = '260px';
+        inp.style.height = '34px';
+        inp.style.fontSize = '16px';
+        inp.style.zIndex = '9999';
+        inp.style.background = '#1e2330';
+        inp.style.color = '#ffffff';
+        inp.style.border = '2px solid gold';
+        inp.style.borderRadius = '6px';
+        inp.style.padding = '4px 8px';
+        document.body.appendChild(inp);
+
+        inp.addEventListener('input', function() {
+            var val = inp.value.slice(0, 40);
+            if (inp.value !== val) inp.value = val;
+            Module.ccall('web_set_username', null, ['string'], [val]);
+        });
+
+        inp.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+                inp.blur();
+                Module.ccall('web_close_keyboard', null, [], []);
+            }
+        });
+    }
+    inp.value = UTF8ToString(initialVal || '');
+    inp.style.display = 'block';
+    setTimeout(function() { inp.focus(); }, 20);
+});
+
+EM_JS(void, js_close_keyboard, (), {
+    var inp = document.getElementById('mobile_username_input');
+    if (inp) {
+        inp.blur();
+        inp.style.display = 'none';
+    }
+});
+
+EM_JS(void, js_toggle_fullscreen, (), {
+    var canvas = document.getElementById('canvas') || document.querySelector('canvas');
+    var target = (canvas && canvas.parentElement) ? canvas.parentElement : canvas;
+    if (!target) return;
+
+    var fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+    if (!fsEl) {
+        var req = target.requestFullscreen || target.webkitRequestFullscreen || target.mozRequestFullScreen || target.msRequestFullscreen;
+        if (req) {
+            try {
+                var p = req.call(target);
+                if (p && p.catch) p.catch(function() {});
+            } catch (e) {}
+        }
+    } else {
+        var exit = document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen || document.msExitFullscreen;
+        if (exit) {
+            try {
+                var p2 = exit.call(document);
+                if (p2 && p2.catch) p2.catch(function() {});
+            } catch (e) {}
+        }
+    }
+});
+
+EM_JS(void, js_fit_canvas_to_viewport, (int gameW, int gameH), {
+    var canvas = document.getElementById('canvas') || document.querySelector('canvas');
+    if (!canvas) return;
+
+    var fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+    var vw = fsEl ? window.screen.width : window.innerWidth;
+    var vh = fsEl ? window.screen.height : window.innerHeight;
+    if (window.visualViewport && !fsEl) {
+        vw = window.visualViewport.width;
+        vh = window.visualViewport.height;
+    }
+
+    var scale = Math.min(vw / gameW, vh / gameH);
+    var dispW = Math.max(1, Math.floor(gameW * scale));
+    var dispH = Math.max(1, Math.floor(gameH * scale));
+    var offX = Math.floor((vw - dispW) * 0.5);
+    var offY = Math.floor((vh - dispH) * 0.5);
+
+    canvas.style.position = 'fixed';
+    canvas.style.left = offX + 'px';
+    canvas.style.top = offY + 'px';
+    canvas.style.width = dispW + 'px';
+    canvas.style.height = dispH + 'px';
+    canvas.style.margin = '0';
+    canvas.style.display = 'block';
+    document.documentElement.style.overflow = 'hidden';
+    document.body.style.overflow = 'hidden';
+    document.body.style.margin = '0';
+    document.body.style.background = '#0d1017';
+
+    Module['_sw_scale'] = scale;
+    Module['_sw_offX'] = offX;
+    Module['_sw_offY'] = offY;
+});
+
+EM_JS(float, js_get_scale, (), {
+    return Module['_sw_scale'] || 1.0;
+});
+
+EM_JS(float, js_get_off_x, (), {
+    return Module['_sw_offX'] || 0.0;
+});
+
+EM_JS(float, js_get_off_y, (), {
+    return Module['_sw_offY'] || 0.0;
+});
+
+extern "C" {
+EMSCRIPTEN_KEEPALIVE
+void web_set_username(const char* str) {
+    if (!str) return;
+    size_t len = std::min(strlen(str), sizeof(usernameInput) - 1);
+    memcpy(usernameInput, str, len);
+    usernameInput[len] = '\0';
+    usernameLen = (int)len;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void web_close_keyboard() {
+    inputBoxActive = false;
+}
+}
+#endif
+
+void SetInputBoxActive(bool active) {
+    if (inputBoxActive == active) return;
+    inputBoxActive = active;
+#if defined(PLATFORM_WEB)
+    if (active) {
+        js_open_keyboard(usernameInput);
+    } else {
+        js_close_keyboard();
+    }
+#endif
+}
+
+void ToggleFullscreenMode() {
+#if defined(PLATFORM_WEB)
+    js_toggle_fullscreen();
+    js_fit_canvas_to_viewport(SCREEN_W, SCREEN_H);
+#else
+    ToggleFullscreen();
+#endif
+}
+
+Vector2 GetLogicalMousePosition() {
+    Vector2 m = GetMousePosition();
+#if defined(PLATFORM_WEB)
+    float s = js_get_scale();
+    float ox = js_get_off_x();
+    float oy = js_get_off_y();
+    if (s > 0.0001f) {
+        // raylib on web may report canvas-relative or client coords depending on shell
+        float lx = (m.x - ox) / s;
+        float ly = (m.y - oy) / s;
+        if (lx >= 0 && lx <= SCREEN_W && ly >= 0 && ly <= SCREEN_H) {
+            return { lx, ly };
+        }
+        float sx = m.x / s;
+        float sy = m.y / s;
+        if (sx >= 0 && sx <= SCREEN_W && sy >= 0 && sy <= SCREEN_H) {
+            return { sx, sy };
+        }
+    }
+#endif
+    return m;
+}
 
 void SaveConfig() {
     json cfg;
@@ -372,17 +564,30 @@ void PollLiveEvents() {
 #endif
 }
 
+void DrawFullscreenButton() {
+    Rectangle fsBtn = { SCREEN_W - 72.0f, SCREEN_H - 42.0f, 56.0f, 30.0f };
+    Vector2 mouse = GetLogicalMousePosition();
+    bool clicked = IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
+
+    DrawRectangleRec(fsBtn, Fade(BLACK, 0.75f));
+    DrawRectangleLinesEx(fsBtn, 2, GOLD);
+    DrawText("FS", (int)fsBtn.x + 17, (int)fsBtn.y + 7, 16, GOLD);
+
+    if (clicked && CheckCollisionPointRec(mouse, fsBtn)) {
+        ToggleFullscreenMode();
+    }
+}
+
 void UpdateDrawMenu() {
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = GetLogicalMousePosition();
     bool clicked = IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
 
     float centerX = SCREEN_W * 0.5f;
     Rectangle inputBox = { centerX - 210.0f, 215.0f, 355.0f, 44.0f };
     Rectangle delBtn   = { centerX + 153.0f, 215.0f, 57.0f,  44.0f };
 
-    // Customizable Win Ratio buttons (e.g., Win 2 / 10)
-    Rectangle winMinusBtn = { centerX - 195.0f, 282.0f, 36.0f, 36.0f };
-    Rectangle winPlusBtn  = { centerX - 95.0f,  282.0f, 36.0f, 36.0f };
+    Rectangle winMinusBtn  = { centerX - 195.0f, 282.0f, 36.0f, 36.0f };
+    Rectangle winPlusBtn   = { centerX - 95.0f,  282.0f, 36.0f, 36.0f };
     Rectangle poolMinusBtn = { centerX + 45.0f,  282.0f, 36.0f, 36.0f };
     Rectangle poolPlusBtn  = { centerX + 145.0f, 282.0f, 36.0f, 36.0f };
     Rectangle resetRecBtn  = { centerX + 115.0f, 326.0f, 95.0f, 26.0f };
@@ -391,10 +596,16 @@ void UpdateDrawMenu() {
     Rectangle quickPlayBtn   = { centerX + 10.0f,  362.0f, 200.0f, 48.0f };
 
     if (clicked) {
-        inputBoxActive = CheckCollisionPointRec(mouse, inputBox) || CheckCollisionPointRec(mouse, delBtn);
-        if (CheckCollisionPointRec(mouse, delBtn) && usernameLen > 0) {
-            usernameLen--;
-            usernameInput[usernameLen] = '\0';
+        if (CheckCollisionPointRec(mouse, delBtn)) {
+            if (usernameLen > 0) {
+                usernameLen--;
+                usernameInput[usernameLen] = '\0';
+            }
+            SetInputBoxActive(true);
+        } else if (CheckCollisionPointRec(mouse, inputBox)) {
+            SetInputBoxActive(true);
+        } else {
+            SetInputBoxActive(false);
         }
 
         if (CheckCollisionPointRec(mouse, winMinusBtn) && targetWins > 1) {
@@ -445,6 +656,7 @@ void UpdateDrawMenu() {
 
     bool triggerConnect = (clicked && CheckCollisionPointRec(mouse, connectPlayBtn)) || IsKeyPressed(KEY_ENTER);
     if (triggerConnect) {
+        SetInputBoxActive(false);
         std::string cleanUser = usernameInput;
         if (!cleanUser.empty() && cleanUser[0] == '@') cleanUser.erase(0, 1);
 
@@ -462,6 +674,7 @@ void UpdateDrawMenu() {
     }
 
     if (clicked && CheckCollisionPointRec(mouse, quickPlayBtn)) {
+        SetInputBoxActive(false);
         SaveConfig();
         connectedUser = "Offline / Sim";
         streamConnected = false;
@@ -483,13 +696,11 @@ void UpdateDrawMenu() {
     int subW = MeasureText(subtitle, 19);
     DrawText(subtitle, (SCREEN_W - subW) / 2, 120, 19, LIGHTGRAY);
 
-    // Main Card
     DrawRectangleRounded({ centerX - 245.0f, 155.0f, 490.0f, 290.0f }, 0.08f, 8, Fade(BLACK, 0.82f));
     DrawRectangleRoundedLinesEx({ centerX - 245.0f, 155.0f, 490.0f, 290.0f }, 0.08f, 8, 2, PURPLE);
 
     DrawText("STREAMER USERNAME (@handle):", (int)(centerX - 210), 185, 17, SKYBLUE);
 
-    // Username Input Box
     DrawRectangleRec(inputBox, Color{30, 35, 48, 255});
     DrawRectangleLinesEx(inputBox, 2, inputBoxActive ? GOLD : GRAY);
     if (usernameLen == 0) {
@@ -505,7 +716,6 @@ void UpdateDrawMenu() {
         DrawRectangle((int)inputBox.x + 16 + textW, (int)inputBox.y + 10, 2, 24, GOLD);
     }
 
-    // Customizable Win Ratio Controls (e.g. Win 2/10)
     DrawText(TextFormat("CUSTOM WIN RATIO: Win %d/%d", targetWins, matchPool),
              (int)(centerX - 210), 263, 16, GOLD);
 
@@ -526,7 +736,6 @@ void UpdateDrawMenu() {
     DrawRectangleRec(resetRecBtn, MAROON);
     DrawText("Reset", (int)resetRecBtn.x + 24, (int)resetRecBtn.y + 6, 14, WHITE);
 
-    // Connect & Play / Sim Buttons
     DrawRectangleRec(connectPlayBtn, Color{110, 40, 175, 255});
     DrawRectangleLinesEx(connectPlayBtn, 2, WHITE);
     DrawText("CONNECT & PLAY", (int)connectPlayBtn.x + 18, (int)connectPlayBtn.y + 15, 18, WHITE);
@@ -541,6 +750,7 @@ void UpdateDrawMenu() {
     DrawText("Custom Art: Edit assets/units.png, assets/statue.png & assets/bg.png | Config: mods/config.json",
              20, SCREEN_H - 28, 14, LIGHTGRAY);
 
+    DrawFullscreenButton();
     EndDrawing();
 }
 
@@ -611,7 +821,6 @@ void UpdateDrawGame() {
         units.erase(std::remove_if(units.begin(), units.end(),
             [](const Unit& u) { return u.hp <= 0.0f; }), units.end());
 
-        // Check match end conditions
         if (enemyStatueHp <= 0.0f) {
             matchResult = MATCH_VICTORY;
             totalWins++;
@@ -629,7 +838,6 @@ void UpdateDrawGame() {
         if (alerts[i].timer <= 0.0f) alerts.erase(alerts.begin() + i);
     }
 
-    // --- DRAW BATTLEFIELD ---
     BeginDrawing();
     DrawTexturePro(bgTex, {0, 0, (float)bgTex.width, (float)bgTex.height},
                    {0, 0, (float)SCREEN_W, (float)SCREEN_H}, {0, 0}, 0.0f, WHITE);
@@ -667,12 +875,11 @@ void UpdateDrawGame() {
         }
     }
 
-    // Top HUD: Gold & Customizable Win Ratio
     DrawText(TextFormat("GOLD: %d", (int)playerGold), 20, 16, 22, GOLD);
     DrawText(TextFormat("WIN RATIO: %d/%d (Rec: %d/%d)", totalWins, matchPool, totalWins, totalMatches),
              165, 19, 18, SKYBLUE);
 
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = GetLogicalMousePosition();
     bool clicked = IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
 
     for (int i = 0; i < (int)unitCatalog.size(); i++) {
@@ -711,7 +918,6 @@ void UpdateDrawGame() {
         DrawText(alerts[i].text.c_str(), 20, 110 + i * 22, 18, alerts[i].color);
     }
 
-    // Collapsible Floating Live Stream Mod Menu
     Rectangle toggleBtn = { SCREEN_W - 175.0f, 15.0f, 160.0f, 36.0f };
     DrawRectangleRec(toggleBtn, Color{120, 40, 180, 240});
     DrawRectangleLinesEx(toggleBtn, 2, WHITE);
@@ -754,7 +960,6 @@ void UpdateDrawGame() {
         }
     }
 
-    // Match End Overlay (Victory / Defeat)
     if (matchResult != MATCH_ACTIVE) {
         DrawRectangle(0, 0, SCREEN_W, SCREEN_H, Fade(BLACK, 0.65f));
         float boxW = 440.0f, boxH = 220.0f;
@@ -794,10 +999,14 @@ void UpdateDrawGame() {
         }
     }
 
+    DrawFullscreenButton();
     EndDrawing();
 }
 
 void UpdateDrawFrame() {
+#if defined(PLATFORM_WEB)
+    js_fit_canvas_to_viewport(SCREEN_W, SCREEN_H);
+#endif
     PollLiveEvents();
     if (currentScreen == SCREEN_MENU) {
         UpdateDrawMenu();
@@ -814,6 +1023,7 @@ int main() {
     InitLiveSocket(9090);
 
 #if defined(PLATFORM_WEB)
+    js_fit_canvas_to_viewport(SCREEN_W, SCREEN_H);
     emscripten_set_main_loop(UpdateDrawFrame, 60, 1);
 #else
     SetTargetFPS(60);
@@ -822,7 +1032,9 @@ int main() {
     }
 #endif
 
+#if !defined(PLATFORM_WEB)
     if (udpSock >= 0) close(udpSock);
+#endif
     UnloadTexture(unitSheet);
     UnloadTexture(statueTex);
     UnloadTexture(bgTex);

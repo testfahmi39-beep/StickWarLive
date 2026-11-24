@@ -52,6 +52,7 @@ jobs:
             -sUSE_GLFW=3 \
             -sALLOW_MEMORY_GROWTH=1 \
             -sASYNCIFY \
+            -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap']" \
             --preload-file assets \
             --preload-file mods
           ls -la web
