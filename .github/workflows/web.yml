@@ -46,7 +46,7 @@ jobs:
 
       - name: Compile StickWarLive to WebAssembly
         run: |
-          mkdir -p web
+          mkdir -p web assets mods
           emcc main.cpp -o web/index.html \
             -O2 -Wall -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES2 \
             -I/tmp/raylib/src -I/tmp/include \
