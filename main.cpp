@@ -1,3 +1,4 @@
+#include "raylib.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <vector>
@@ -5,8 +6,8 @@
 #include <cmath>
 #include <algorithm>
 #include <iostream>
+#include <cstring>
 
-// POSIX non-blocking UDP sockets (native builds)
 #if !defined(PLATFORM_WEB)
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -14,7 +15,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #endif
-#include <cstring>
 
 #if defined(PLATFORM_WEB)
 #include <emscripten/emscripten.h>
@@ -109,10 +109,10 @@ bool rageActive = false;
 float rageTimer = 0.0f;
 
 // Customizable Win Ratio State (e.g., Win 2/10)
-int targetWins = 2;     // Numerator (e.g., 2)
-int matchPool = 10;     // Denominator / series size (e.g., 10)
-int totalWins = 0;      // Actual wins recorded
-int totalMatches = 0;   // Actual matches played
+int targetWins = 2;
+int matchPool = 10;
+int totalWins = 0;
+int totalMatches = 0;
 
 // Main Menu & Live Stream Connector State
 char usernameInput[64] = "";
@@ -126,65 +126,60 @@ bool liveMenuOpen = true;
 int udpSock = -1;
 int liveEventsReceived = 0;
 
-// Web viewport transform for accurate touch/click & aspect-fit fullscreen
-float viewScale = 1.0f;
-float viewOffsetX = 0.0f;
-float viewOffsetY = 0.0f;
-
 #if defined(PLATFORM_WEB)
 EM_JS(void, js_open_keyboard, (const char* initialVal), {
-    var inp = document.getElementById('mobile_username_input');
+    var inp = document.getElementById("mobile_username_input");
     if (!inp) {
-        inp = document.createElement('input');
-        inp.id = 'mobile_username_input';
-        inp.type = 'text';
-        inp.autocapitalize = 'off';
-        inp.autocomplete = 'off';
-        inp.autocorrect = 'off';
+        inp = document.createElement("input");
+        inp.id = "mobile_username_input";
+        inp.type = "text";
+        inp.autocapitalize = "off";
+        inp.autocomplete = "off";
+        inp.autocorrect = "off";
         inp.spellcheck = false;
-        inp.style.position = 'fixed';
-        inp.style.left = '50%';
-        inp.style.top = '10px';
-        inp.style.transform = 'translateX(-50%)';
-        inp.style.width = '260px';
-        inp.style.height = '34px';
-        inp.style.fontSize = '16px';
-        inp.style.zIndex = '9999';
-        inp.style.background = '#1e2330';
-        inp.style.color = '#ffffff';
-        inp.style.border = '2px solid gold';
-        inp.style.borderRadius = '6px';
-        inp.style.padding = '4px 8px';
+        inp.style.position = "fixed";
+        inp.style.left = "50%";
+        inp.style.top = "10px";
+        inp.style.transform = "translateX(-50%)";
+        inp.style.width = "260px";
+        inp.style.height = "34px";
+        inp.style.fontSize = "16px";
+        inp.style.zIndex = "9999";
+        inp.style.background = "#1e2330";
+        inp.style.color = "#ffffff";
+        inp.style.border = "2px solid gold";
+        inp.style.borderRadius = "6px";
+        inp.style.padding = "4px 8px";
         document.body.appendChild(inp);
 
-        inp.addEventListener('input', function() {
+        inp.addEventListener("input", function() {
             var val = inp.value.slice(0, 40);
             if (inp.value !== val) inp.value = val;
-            Module.ccall('web_set_username', null, ['string'], [val]);
+            Module.ccall("web_set_username", null, ["string"], [val]);
         });
 
-        inp.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') {
+        inp.addEventListener("keydown", function(e) {
+            if (e.key === "Enter") {
                 inp.blur();
-                Module.ccall('web_close_keyboard', null, [], []);
+                Module.ccall("web_close_keyboard", null, [], []);
             }
         });
     }
-    inp.value = UTF8ToString(initialVal || '');
-    inp.style.display = 'block';
+    inp.value = UTF8ToString(initialVal || "");
+    inp.style.display = "block";
     setTimeout(function() { inp.focus(); }, 20);
 });
 
 EM_JS(void, js_close_keyboard, (), {
-    var inp = document.getElementById('mobile_username_input');
+    var inp = document.getElementById("mobile_username_input");
     if (inp) {
         inp.blur();
-        inp.style.display = 'none';
+        inp.style.display = "none";
     }
 });
 
 EM_JS(void, js_toggle_fullscreen, (), {
-    var canvas = document.getElementById('canvas') || document.querySelector('canvas');
+    var canvas = document.getElementById("canvas") || document.querySelector("canvas");
     var target = (canvas && canvas.parentElement) ? canvas.parentElement : canvas;
     if (!target) return;
 
@@ -209,7 +204,7 @@ EM_JS(void, js_toggle_fullscreen, (), {
 });
 
 EM_JS(void, js_fit_canvas_to_viewport, (int gameW, int gameH), {
-    var canvas = document.getElementById('canvas') || document.querySelector('canvas');
+    var canvas = document.getElementById("canvas") || document.querySelector("canvas");
     if (!canvas) return;
 
     var fsEl = document.fullscreenElement || document.webkitFullscreenElement;
@@ -226,33 +221,33 @@ EM_JS(void, js_fit_canvas_to_viewport, (int gameW, int gameH), {
     var offX = Math.floor((vw - dispW) * 0.5);
     var offY = Math.floor((vh - dispH) * 0.5);
 
-    canvas.style.position = 'fixed';
-    canvas.style.left = offX + 'px';
-    canvas.style.top = offY + 'px';
-    canvas.style.width = dispW + 'px';
-    canvas.style.height = dispH + 'px';
-    canvas.style.margin = '0';
-    canvas.style.display = 'block';
-    document.documentElement.style.overflow = 'hidden';
-    document.body.style.overflow = 'hidden';
-    document.body.style.margin = '0';
-    document.body.style.background = '#0d1017';
+    canvas.style.position = "fixed";
+    canvas.style.left = offX + "px";
+    canvas.style.top = offY + "px";
+    canvas.style.width = dispW + "px";
+    canvas.style.height = dispH + "px";
+    canvas.style.margin = "0";
+    canvas.style.display = "block";
+    document.documentElement.style.overflow = "hidden";
+    document.body.style.overflow = "hidden";
+    document.body.style.margin = "0";
+    document.body.style.background = "#0d1017";
 
-    Module['_sw_scale'] = scale;
-    Module['_sw_offX'] = offX;
-    Module['_sw_offY'] = offY;
+    Module["_sw_scale"] = scale;
+    Module["_sw_offX"] = offX;
+    Module["_sw_offY"] = offY;
 });
 
 EM_JS(float, js_get_scale, (), {
-    return Module['_sw_scale'] || 1.0;
+    return Module["_sw_scale"] || 1.0;
 });
 
 EM_JS(float, js_get_off_x, (), {
-    return Module['_sw_offX'] || 0.0;
+    return Module["_sw_offX"] || 0.0;
 });
 
 EM_JS(float, js_get_off_y, (), {
-    return Module['_sw_offY'] || 0.0;
+    return Module["_sw_offY"] || 0.0;
 });
 
 extern "C" {
@@ -300,16 +295,15 @@ Vector2 GetLogicalMousePosition() {
     float ox = js_get_off_x();
     float oy = js_get_off_y();
     if (s > 0.0001f) {
-        // raylib on web may report canvas-relative or client coords depending on shell
         float lx = (m.x - ox) / s;
         float ly = (m.y - oy) / s;
         if (lx >= 0 && lx <= SCREEN_W && ly >= 0 && ly <= SCREEN_H) {
-            return { lx, ly };
+            return Vector2{ lx, ly };
         }
         float sx = m.x / s;
         float sy = m.y / s;
         if (sx >= 0 && sx <= SCREEN_W && sy >= 0 && sy <= SCREEN_H) {
-            return { sx, sy };
+            return Vector2{ sx, sy };
         }
     }
 #endif
@@ -512,6 +506,8 @@ void InitLiveSocket(int port) {
             udpSock = -1;
         }
     }
+#else
+    (void)port;
 #endif
 }
 
@@ -532,6 +528,9 @@ void SendBridgeCommand(const std::string& action, const std::string& username) {
     std::string payload = cmd.dump();
     sendto(txSock, payload.c_str(), payload.size(), 0, (sockaddr*)&bridgeAddr, sizeof(bridgeAddr));
     close(txSock);
+#else
+    (void)action;
+    (void)username;
 #endif
 }
 
@@ -682,7 +681,6 @@ void UpdateDrawMenu() {
         currentScreen = SCREEN_PLAYING;
     }
 
-    // --- DRAW MAIN MENU ---
     BeginDrawing();
     DrawTexturePro(bgTex, {0, 0, (float)bgTex.width, (float)bgTex.height},
                    {0, 0, (float)SCREEN_W, (float)SCREEN_H}, {0, 0}, 0.0f, Color{150, 150, 170, 255});
