@@ -1,3 +1,4 @@
+#include "raylib.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <vector>
