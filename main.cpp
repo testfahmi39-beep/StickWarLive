@@ -345,7 +345,9 @@ Vector2 GetLogicalMousePosition() {
 
 bool WasLogicalClickPressed() {
 #if defined(PLATFORM_WEB)
-    return IsMouseButtonPressed(MOUSE_LEFT_BUTTON) || (js_consume_pointer_pressed() != 0);
+    bool jsPressed = (js_consume_pointer_pressed() != 0);
+    bool rlPressed = IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
+    return jsPressed || rlPressed;
 #else
     return IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
 #endif
